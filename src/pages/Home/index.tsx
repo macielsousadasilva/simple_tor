@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { 
   Text, 
   ScrollView, 
@@ -7,7 +7,8 @@ import {
   StyleSheet,
   ActivityIndicator,
   StatusBar,
-  TextInput
+  TextInput,
+  Alert
 } from 'react-native';
 import { 
   TorStatus, 
@@ -19,7 +20,8 @@ import {
   put,
   del,
   reconnect, 
-  cleanup 
+  cleanup,
+  getConnectionDuration_func
 } from '../../services/TorService';
 
 export default function App() {
@@ -38,20 +40,52 @@ export default function App() {
   const [body, setBody] = useState('{\n  "test": "data"\n}');
   const [response, setResponse] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [connectionDuration, setConnectionDuration] = useState('');
 
   const methods = ['GET', 'POST', 'PUT', 'DELETE'] as const;
+  const statusUpdateInterval = useRef<NodeJS.Timeout>();
 
   useEffect(() => {
-    const unsubscribe = onStatusChange(setTorStatus);
+    const unsubscribe = onStatusChange((status: TorStatus) => {
+      console.log('📊 Status atualizado no componente:', status);
+      
+      // Detectar mudanças importantes
+      const wasConnected = torStatus.isReady;
+      const isNowConnected = status.isReady;
+      
+      setTorStatus(status);
+      
+      // Alertas para mudanças de estado
+      if (isNowConnected && !wasConnected && !status.isReconnecting) {
+        Alert.alert('🎉 Conectado!', 'Tor está conectado e pronto para uso');
+      } else if (!isNowConnected && wasConnected) {
+        Alert.alert('⚠️ Desconectado', status.lastError || 'Conexão perdida');
+      } else if (status.isReconnecting) {
+        console.log('🔄 Reconectando automaticamente...');
+      }
+    });
+
+    // Atualizar duração da conexão em tempo real
+    statusUpdateInterval.current = setInterval(() => {
+      if (torStatus.isReady) {
+        setConnectionDuration(getConnectionDuration_func());
+      } else {
+        setConnectionDuration('');
+      }
+    }, 1000);
+
     initializeTor();
     
-    return () => {
-      unsubscribe();
+    return () => { 
+      unsubscribe(); 
       cleanup();
+      if (statusUpdateInterval.current) {
+        clearInterval(statusUpdateInterval.current);
+      }
     };
   }, []);
 
-  // ✅ VERSÃO SIMPLIFICADA - Fazer requisição
+  // ✅ Fazer requisição com validações
   const handleMakeRequest = async () => {
     if (!torStatus.isReady || isLoading) return;
 
@@ -59,137 +93,206 @@ export default function App() {
     setResponse('🔄 Fazendo requisição...');
     
     try {
-      // Parse dos headers
-      let parsedHeaders = {};
-      try {
-        parsedHeaders = JSON.parse(headers);
-      } catch (e) {
-        throw new Error('Headers inválidos - deve ser JSON válido');
+      // Validar URL
+      if (!url.trim()) {
+        throw new Error('URL é obrigatória');
       }
       
-      let result;
+      // Parse e validação dos headers
+      let parsedHeaders = {};
+      if (headers.trim()) {
+        try {
+          parsedHeaders = JSON.parse(headers);
+          if (typeof parsedHeaders !== 'object' || Array.isArray(parsedHeaders)) {
+            throw new Error('Headers devem ser um objeto JSON válido');
+          }
+        } catch (e) {
+          throw new Error('Headers inválidos - deve ser JSON válido');
+        }
+      }
       
-      // ✅ OPÇÃO 1: Usando makeRequest simplificado
-      result = await makeRequest(url, method, {
+      // Validar body para métodos que precisam
+      let requestBody = '';
+      if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+        requestBody = body.trim();
+        if (requestBody) {
+          try {
+            JSON.parse(requestBody); // Validar se é JSON válido
+          } catch (e) {
+            console.warn('⚠️ Body não é JSON válido, enviando como texto');
+          }
+        }
+      }
+      
+      console.log(`📡 Enviando ${method} para: ${url}`);
+      console.log(`📋 Headers:`, parsedHeaders);
+      if (requestBody) console.log(`📄 Body:`, requestBody);
+      
+      // Fazer requisição
+      const result = await makeRequest(url.trim(), method, {
         headers: parsedHeaders,
-        body: (method === 'POST' || method === 'PUT' || method === 'DELETE') ? body : undefined,
+        body: requestBody || undefined,
       });
       
-      // ✅ OPÇÃO 2: Usando funções auxiliares (mais limpo)
-      // switch (method) {
-      //   case 'GET':
-      //     result = await get(url, parsedHeaders);
-      //     break;
-      //   case 'POST':
-      //     result = await post(url, body, parsedHeaders);
-      //     break;
-      //   case 'PUT':
-      //     result = await put(url, body, parsedHeaders);
-      //     break;
-      //   case 'DELETE':
-      //     result = await del(url, body, parsedHeaders);
-      //     break;
-      // }
-      
       // Formatar resposta
-      let formattedResponse = `Status: ${result.respCode}\n`;
-      formattedResponse += `MIME Type: ${result.mimeType}\n\n`;
+      let formattedResponse = `✅ Requisição ${method} bem-sucedida!\n\n`;
+      formattedResponse += `Status: ${result.respCode || 'N/A'}\n`;
+      formattedResponse += `MIME Type: ${result.mimeType || 'N/A'}\n`;
+      formattedResponse += `Timestamp: ${new Date().toLocaleString()}\n\n`;
       
-      if (result.headers) {
-        formattedResponse += `Headers:\n${JSON.stringify(result.headers, null, 2)}\n\n`;
+      if (result.headers && Object.keys(result.headers).length > 0) {
+        formattedResponse += `📋 Headers de Resposta:\n${JSON.stringify(result.headers, null, 2)}\n\n`;
       }
       
       if (result.json) {
-        formattedResponse += `JSON Response:\n${JSON.stringify(result.json, null, 2)}`;
+        formattedResponse += `📄 JSON Response:\n${JSON.stringify(result.json, null, 2)}`;
       } else if (result.b64Data) {
         try {
           const decoded = atob(result.b64Data);
-          formattedResponse += `Response Body:\n${decoded}`;
+          if (decoded.length > 2000) {
+            formattedResponse += `📄 Response Body (${decoded.length} chars):\n${decoded.substring(0, 2000)}...\n\n[Resposta truncada]`;
+          } else {
+            formattedResponse += `📄 Response Body:\n${decoded}`;
+          }
         } catch (e) {
-          formattedResponse += `Base64 Data:\n${result.b64Data.substring(0, 1000)}${result.b64Data.length > 1000 ? '...' : ''}`;
+          const preview = result.b64Data.substring(0, 500);
+          formattedResponse += `📄 Base64 Data (${result.b64Data.length} chars):\n${preview}${result.b64Data.length > 500 ? '...' : ''}`;
         }
       } else {
-        formattedResponse += 'Sem dados na resposta';
+        formattedResponse += '📄 Sem dados na resposta';
       }
       
       setResponse(formattedResponse);
       
     } catch (error) {
       console.error(`❌ Erro na requisição:`, error);
-      setResponse(`❌ Erro: ${error.message}`);
+      const errorResponse = `❌ Erro na requisição ${method}:\n\n${error.message}\n\nTimestamp: ${new Date().toLocaleString()}`;
+      setResponse(errorResponse);
+      
+      // Mostrar alerta para erros críticos
+      if (error.message.includes('Tor não está conectado')) {
+        Alert.alert(
+          '🚨 Erro de Conexão',
+          'Tor não está conectado. Tentando reconectar...',
+          [
+            { text: 'OK', style: 'cancel' },
+            { text: 'Reconectar Agora', onPress: handleReconnect }
+          ]
+        );
+      }
     } finally {
       setIsLoading(false);
     }
   };
 
-  // ✅ EXEMPLOS DE USO SIMPLIFICADO
+  // ✅ Exemplo simplificado com validações
   const exemploSimples = async () => {
+    if (!torStatus.isReady) {
+      Alert.alert('⚠️ Tor Desconectado', 'Aguarde a conexão ser estabelecida');
+      return;
+    }
+
     setIsLoading(true);
+    setResponse('🔄 Executando exemplos...');
+    
     try {
       // Exemplo 1: GET simples
-      const resultado1 = await get('http://example.onion/api/users');
+      console.log('📡 Exemplo 1: GET simples');
+      const resultado1 = await get(url);
       
-      // Exemplo 2: POST com dados
-      const resultado2 = await post(
-        'http://example.onion/api/users',
-        JSON.stringify({ name: 'João', age: 30 }),
-        { 'Content-Type': 'application/json' }
-      );
+      // Exemplo 2: POST com dados (se URL suportar)
+      console.log('📡 Exemplo 2: POST com dados');
+      const postData = JSON.stringify({ 
+        timestamp: new Date().toISOString(),
+        test: 'exemplo_post' 
+      });
       
-      // Exemplo 3: Usando makeRequest
-      const resultado3 = await makeRequest(
-        'http://example.onion/api/search',
-        'GET',
-        { headers: { 'Accept': 'application/json' } }
-      );
+      let resultado2;
+      try {
+        resultado2 = await post(url, postData, { 'Content-Type': 'application/json' });
+      } catch (e) {
+        console.log('⚠️ POST falhou (esperado para APIs somente leitura)');
+        resultado2 = { error: 'POST não suportado pela API' };
+      }
       
-      console.log('✅ Resultados:', { resultado1, resultado2, resultado3 });
-      setResponse(`Exemplos executados com sucesso!\nVeja o console para detalhes.`);
+      const exemplosResponse = `✅ Exemplos executados com sucesso!\n\nTimestamp: ${new Date().toLocaleString()}\n\n📋 Resultado GET:\n${JSON.stringify(resultado1, null, 2)}\n\n📋 Resultado POST:\n${JSON.stringify(resultado2, null, 2)}`;
+      setResponse(exemplosResponse);
       
     } catch (error) {
       console.error('❌ Erro nos exemplos:', error);
-      setResponse(`❌ Erro: ${error.message}`);
+      setResponse(`❌ Erro nos exemplos: ${error.message}\n\nTimestamp: ${new Date().toLocaleString()}`);
     } finally {
       setIsLoading(false);
     }
   };
 
   const handleReconnect = () => {
+    Alert.alert(
+      '🔄 Reconectando',
+      'Tentando estabelecer nova conexão com Tor...'
+    );
     reconnect();
+  };
+
+  const getStatusColor = () => {
+    if (torStatus.isReady) return '#4caf50';
+    if (torStatus.isInitializing || torStatus.isReconnecting) return '#ff9800';
+    return '#f44336';
+  };
+
+  const getStatusText = () => {
+    if (torStatus.isReady) {
+      return `✅ Conectado${connectionDuration ? ` (${connectionDuration})` : ''}`;
+    }
+    if (torStatus.isReconnecting) {
+      return `🔄 Reconectando... ${torStatus.reconnectAttempt > 0 ? `(${torStatus.reconnectAttempt}/5)` : ''}`;
+    }
+    if (torStatus.isInitializing) {
+      return `⏳ Conectando... ${torStatus.reconnectAttempt > 0 ? `(${torStatus.reconnectAttempt}/5)` : ''}`;
+    }
+    return '❌ Desconectado';
+  };
+
+  const getDetailedInfo = () => {
+    const info = [];
+    if (torStatus.socksPort > 0) info.push(`Porta: ${torStatus.socksPort}`);
+    if (torStatus.lastError) info.push(`Erro: ${torStatus.lastError}`);
+    if (torStatus.lastHealthCheck) {
+      info.push(`Último check: ${new Date(torStatus.lastHealthCheck).toLocaleTimeString()}`);
+    }
+    return info.join(' | ');
   };
 
   return (
     <View style={styles.container}>
-      <StatusBar backgroundColor="#1976d2" barStyle="light-content" />
+      <StatusBar backgroundColor={getStatusColor()} barStyle="light-content" />
       
-      {/* Header */}
-      <View style={[
-        styles.header,
-        torStatus.isReady && styles.headerSuccess,
-        (!torStatus.isReady && !torStatus.isInitializing) && styles.headerError
-      ]}>
-        <Text style={styles.title}>🧅 Tor HTTP Client (Simplificado)</Text>
+      {/* Header com status em tempo real */}
+      <View style={[styles.header, { backgroundColor: getStatusColor() }]}>
+        <Text style={styles.title}>🧅 Tor HTTP Client</Text>
         <View style={styles.statusContainer}>
-          {torStatus.isInitializing ? (
+          {(torStatus.isInitializing || torStatus.isReconnecting) ? (
             <View style={styles.statusRow}>
               <ActivityIndicator size="small" color="white" />
-              <Text style={styles.statusText}>
-                {torStatus.reconnectAttempt > 1 ? `Reconectando... (${torStatus.reconnectAttempt})` : 'Conectando...'}
-              </Text>
+              <Text style={styles.statusText}>{getStatusText()}</Text>
             </View>
-          ) : torStatus.isReady ? (
-            <Text style={styles.statusText}>✅ Conectado - Porta {torStatus.socksPort}</Text>
           ) : (
-            <View style={styles.statusRow}>
-              <Text style={styles.statusText}>❌ Desconectado</Text>
-              <TouchableOpacity 
-                style={styles.reconnectButton}
-                onPress={handleReconnect}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.reconnectButtonText}>🔄</Text>
-              </TouchableOpacity>
+            <View style={styles.statusColumn}>
+              <Text style={styles.statusText}>{getStatusText()}</Text>
+              {getDetailedInfo() && (
+                <Text style={styles.statusDetails}>{getDetailedInfo()}</Text>
+              )}
             </View>
+          )}
+          
+          {!torStatus.isReady && !torStatus.isInitializing && !torStatus.isReconnecting && (
+            <TouchableOpacity 
+              style={styles.reconnectButton}
+              onPress={handleReconnect}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.reconnectButtonText}>🔄 Reconectar</Text>
+            </TouchableOpacity>
           )}
         </View>
       </View>
@@ -203,7 +306,7 @@ export default function App() {
           activeOpacity={0.7}
         >
           <Text style={styles.sendButtonText}>
-            🚀 Executar Exemplos Simplificados
+            🚀 Executar Exemplos Validados
           </Text>
         </TouchableOpacity>
 
@@ -292,7 +395,7 @@ export default function App() {
             <ActivityIndicator size="small" color="white" />
           ) : (
             <Text style={styles.sendButtonText}>
-              📡 Enviar {method}
+              📡 Enviar {method} Validado
             </Text>
           )}
         </TouchableOpacity>
@@ -317,7 +420,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
   },
   header: {
-    backgroundColor: '#1976d2',
     padding: 20,
     paddingTop: 40,
     elevation: 4,
@@ -325,12 +427,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.2,
     shadowRadius: 4,
-  },
-  headerSuccess: {
-    backgroundColor: '#4caf50',
-  },
-  headerError: {
-    backgroundColor: '#f44336',
   },
   title: {
     fontSize: 22,
@@ -346,22 +442,32 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
+  statusColumn: {
+    alignItems: 'center',
+  },
   statusText: {
     color: 'white',
     fontSize: 14,
     marginLeft: 8,
     fontWeight: '500',
   },
+  statusDetails: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 11,
+    marginTop: 4,
+    textAlign: 'center',
+  },
   reconnectButton: {
     backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-    marginLeft: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    marginTop: 8,
   },
   reconnectButtonText: {
     color: 'white',
     fontSize: 12,
+    fontWeight: '500',
   },
   content: {
     flex: 1,
